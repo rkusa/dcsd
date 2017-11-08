@@ -4,23 +4,15 @@
 
 extern crate futures;
 extern crate tokio_core;
-extern crate tokio_io;
 
 use std::fmt;
+use std::io;
 use std::env;
 use std::net::SocketAddr;
-use std::collections::HashMap;
-use std::rc::Rc;
-use std::cell::RefCell;
-use std::iter;
-use std::io::{Error, ErrorKind, BufReader};
 
-use futures::Future;
-use futures::stream::{self, Stream};
-use tokio_core::net::TcpListener;
+use futures::{Future, Stream, Sink};
 use tokio_core::reactor::Core;
-use tokio_io::io;
-use tokio_io::AsyncRead;
+use tokio_core::net::{UdpSocket, UdpCodec};
 
 fn main() {
     // use first argument as address or default to 127.0.0.1:8080
@@ -35,118 +27,70 @@ fn run(addr: &SocketAddr) {
     let mut core = Core::new().unwrap();
     let handle = core.handle();
 
-    // create TCP listener
-    let socket = TcpListener::bind(&addr, &handle).unwrap();
+    // create UDP listener
+    let socket = UdpSocket::bind(&addr, &handle).unwrap();
     println!("Listening on {}", addr);
 
-    // single-threaded server for now -> just use Rc and RefCell to store map of
-    // all connections
-    let connections = Rc::new(RefCell::new(HashMap::new()));
+    let (sink, stream) = socket.framed(LineCodec).split();
+    let (tx, rx) = futures::sync::mpsc::unbounded();
 
-    // convert TCP listener to stream of incoming connections
-    let done = socket.incoming().for_each(move |(socket, addr)| {
-        // this closure represents an accepted client (with socket being the client
-        // connection and addr the remote address of the client)
+    let socket_writer = rx.fold(sink, |sink, (addr, msg)| {
+        sink.send((addr, msg))
+            .map(|sink| sink)
+            .map_err(|_| ())
+    });
 
-        //
-        println!("New Connection: {}", addr);
-        let (reader, writer) = socket.split();
+    handle.spawn(socket_writer.map(|_| ()));
 
-        // create a channel for our stream
-        let (tx, rx) = futures::sync::mpsc::unbounded();
-        connections.borrow_mut().insert(addr, tx);
+    let srv = stream.for_each(move |(addr, mut msg)| {
+        msg.pop(); // remove trailing newline
+        let msg = String::from_utf8_lossy(&msg);
 
-        let connections_inner = connections.clone();
-        let reader = BufReader::new(reader);
+        println!("received {}", msg);
 
-        // create an infinite iterator to read lines from the socket
-        let iter = stream::iter_ok::<_, Error>(iter::repeat(()));
-        let socket_reader = iter.fold(reader, move |reader, _| {
-            // read until newline
-            let line = io::read_until(reader, b'\n', Vec::new());
-            let line = line.and_then(|(reader, vec)| {
-                if vec.len() == 0 {
-                    Err(Error::new(ErrorKind::BrokenPipe, "broken pipe"))
-                } else {
-                    Ok((reader, vec))
-                }
-            });
+        let parts = msg.split(":").collect::<Vec<_>>();
 
-            // convert bytes into string
-            let line = line.map(|(reader, vec)| (reader, String::from_utf8(vec)));
+        if parts.len() >= 2 {
+            match parts[0] {
+                "ev" => {
+                    let event = to_event(parts[1]);
+                    println!("received event {}", event);
 
-            let connections = connections_inner.clone();
-            line.map(move |(reader, message)| {
-                let mut conns = connections.borrow_mut();
-                if let Ok(mut msg) = message {
-                    msg.pop(); // remove trailing newline
+                    match event {
+                        Event::Ejection => {
+                            println!("sending message ...");
 
-                    println!("received {}", msg);
-
-                    let parts = msg.split(":").collect::<Vec<_>>();
-
-                    if parts.len() >= 2 {
-                        match parts[0] {
-                            "ev" => {
-                                let event = to_event(parts[1]);
-                                println!("received event {}", event);
-                                match event {
-                                    Event::Ejection => {
-                                        println!("sending message ...");
-
-                                        let iter = conns.iter_mut()
-                                                        // .filter(|&(&k, _)| k != addr)
-                                                        .map(|(_, v)| v);
-                                        for tx in iter {
-                                            tx.unbounded_send("cyaaa".to_string()).unwrap();
-                                        }
-                                    },
-                                    _ => {}
-                                }
-
-                            }
-                            _ => {
-                                println!("received invalid operation: {}", parts[0]);
-                            }
-                        }
+                            tx.unbounded_send((addr, b"cyaaa".to_vec())).unwrap();
+                        },
+                        _ => {}
                     }
-
-                    // let iter = conns.iter_mut()
-                    //                 // .filter(|&(&k, _)| k != addr)
-                    //                 .map(|(_, v)| v);
-                    // for tx in iter {
-                    //     tx.send(format!("{}: {}", addr, msg)).unwrap();
-                    // }
-                } else {
-                    let tx = conns.get_mut(&addr).unwrap();
-                    tx.unbounded_send("invalid UTF-8".to_string()).unwrap();
                 }
-                reader
-            })
-        });
-
-        // writer part
-        let socket_writer = rx.fold(writer, |writer, msg| {
-            let amt = io::write_all(writer, msg.into_bytes());
-            let amt = amt.map(|(writer, _)| writer);
-            amt.map_err(|_| ())
-        });
-
-        // combine reader and writer to wait for either half to be done to tear down the other
-        let connections = connections.clone();
-        let socket_reader = socket_reader.map_err(|_| ());
-        let connection = socket_reader.map(|_| ()).select(socket_writer.map(|_| ()));
-        handle.spawn(connection.then(move |_| {
-            connections.borrow_mut().remove(&addr);
-            println!("Connection {} closed", addr);
-            Ok(())
-        }));
+                _ => {
+                    println!("received invalid operation: {}", parts[0]);
+                }
+            }
+        }
 
         Ok(())
     });
 
-    // run server ...
-    core.run(done).unwrap();
+    core.run(srv).unwrap();
+}
+
+pub struct LineCodec;
+
+impl UdpCodec for LineCodec {
+    type In = (SocketAddr, Vec<u8>);
+    type Out = (SocketAddr, Vec<u8>);
+
+    fn decode(&mut self, addr: &SocketAddr, buf: &[u8]) -> io::Result<Self::In> {
+        Ok((*addr, buf.to_vec()))
+    }
+
+    fn encode(&mut self, (addr, buf): Self::Out, into: &mut Vec<u8>) -> SocketAddr {
+        into.extend(buf);
+        addr
+    }
 }
 
 #[derive(Debug)]

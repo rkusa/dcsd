@@ -27,14 +27,10 @@ dcsd = {}
 dcsd.receive = function()
 	-- env.info("[dcsd] receiving data ...")
 
-	local line, err = dcsd.conn:receive()
-	if err then
-		if err ~= "timeout" then
-			env.info("[dcsd] read error: "..err)
-		end
-	else
+	local line = dcsd.udp:receive()
+	if line then
 		env.info("[dcsd] received: "..line)
-		trigger.action.outText(line, 10)
+		trigger.action.outText(line, 0)
 	end
 end
 
@@ -50,13 +46,10 @@ dcsd.start = function(mission_env_, host, port)
 	end
 
 	env.info("starting dcsd ...")
-	dcsd.conn = socket.try(socket.connect(host, port))
-	dcsd.conn:settimeout(.0001)
-	dcsd.conn:setoption("keepalive", true)
-	dcsd.conn:setoption("tcp-nodelay", true)
-
-	env.info("[dcsd] sending data ...")
-	socket.try(dcsd.conn:send("hello world\n"))
+	dcsd.udp = socket.udp()
+	-- dcsd.udp:setsockname("*", 0)
+	dcsd.udp:setsockname("*", 8081)
+	dcsd.udp:settimeout(0)
 
 	local fn = timer.scheduleFunction(function(arg, time)
 		dcsd.receive()
@@ -69,7 +62,7 @@ dcsd.start = function(mission_env_, host, port)
 	function eventHandler:onEvent(event)
 		env.info("[dcsd] event "..event.id)
 
-		socket.try(dcsd.conn:send("ev:"..event.id.."\n"))
+		socket.try(dcsd.udp:sendto("ev:"..event.id.."\n", host, port))
 		--socket.try(dcsd.conn:send(JSON:encode(event):gsub("\n", "").."\n"))
 	end
 
